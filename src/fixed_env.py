@@ -47,6 +47,14 @@ class Environment:
                 for line in f:
                     self.video_size[bitrate].append(int(line.split()[0]))
 
+    def get_chunk_size(self, quality, index):
+        if index < 0 or index > VIDEO_CHUNCK_LEN:
+            return 0
+        return self.video_size[quality][index]
+    
+    def get_total_chunk_len(self):
+        return VIDEO_CHUNCK_LEN
+
     def get_video_chunk(self, quality):
 
         assert quality >= 0
