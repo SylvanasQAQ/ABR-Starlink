@@ -10,9 +10,9 @@ import itertools
 os.environ['CUDA_VISIBLE_DEVICES']=''
 import tensorflow as tf
 import a3c
-#NN_MODEL = './models/pretrain_linear_reward.ckpt'
-NN_MODEL = './models/nn_model_ep_27000.ckpt'
-
+NN_MODEL = './models/pretrain_linear_reward.ckpt'
+# NN_MODEL = './models/nn_model_ep_50000.ckpt-origin'
+os.chdir('/root/repos/ABR-Starlink/src')
 
 S_INFO = 6  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
 S_LEN = 8  # take how many frames in the past
@@ -30,9 +30,30 @@ DEFAULT_QUALITY = 1  # default video quality without agent
 RANDOM_SEED = 42
 TEST_TRACES = "./test/"
 
-# MPC, BBA-0
-abr_policy = "Pensieve"
-LOG_PATH = "./test_results/Pensieve-retrain/"
+# MPC, BBA-0, RBA, Pensieve
+abr_choice = 5
+
+if abr_choice == 0:
+    abr_policy = "MPC"
+    LOG_PATH = "./test_results/MPC/"
+elif abr_choice == 1:
+    abr_policy = "BBA-0"
+    LOG_PATH = "./test_results/bba-0/"
+elif abr_choice == 2:
+    abr_policy = "RBA"
+    LOG_PATH = "./test_results/RBA/"
+elif abr_choice == 3:
+    abr_policy = "Pensieve"
+    LOG_PATH = "./test_results/Pensieve/"
+    NN_MODEL = './models/pretrain_linear_reward.ckpt'
+elif abr_choice == 4:
+    abr_policy = "Pensieve"
+    LOG_PATH = "./test_results/Pensieve-retrain/"
+    NN_MODEL = './models/nn_model_ep_50000.ckpt-origin'
+elif abr_choice == 5:
+    abr_policy = "Mixed"
+    LOG_PATH = "./test_results/Pensieve-modify/"
+    NN_MODEL = './models/nn_model_ep_50000.ckpt-origin'
 
 
 def main():
@@ -71,6 +92,7 @@ def main():
     entropy_record = []
     entropy_ = 0.5
     video_count = 0
+    delay = 30
 
     while True:  # serve video forever
         # the action is from the last decision
@@ -100,7 +122,7 @@ def main():
 
         r_batch.append(reward)
 
-        last_bit_rate = bit_rate
+        
 
         # log time_stamp, bit_rate, buffer_size, reward
         log_file.write(
@@ -129,6 +151,8 @@ def main():
         )
         log_file.flush()
 
+        last_bit_rate = bit_rate
+
         # retrieve previous state
         if len(s_batch) == 0:
             state = [np.zeros((S_INFO, S_LEN))]
@@ -138,14 +162,14 @@ def main():
         # dequeue history record
         state = np.roll(state, -1, axis=1)
 
-        delay = float(delay) - env.LINK_RTT
+        delay = float(delay) #- env.LINK_RTT
         if abr_policy == "MPC":
             state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality
             state[1, -1] = buffer_size / BUFFER_NORM_FACTOR
             state[2, -1] = rebuf
-            state[3, -1] = float(video_chunk_size) / float(delay) / M_IN_K / 100.0 # kilo byte / ms
+            state[3, -1] = float(video_chunk_size) / float(delay) / M_IN_K # kilo byte / ms
             state[4, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
-        elif abr_policy == "Pensieve":
+        elif abr_policy == "Pensieve" or abr_policy == "Mixed":
             state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality
             state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec
             state[2, -1] = float(video_chunk_size) / float(delay) / M_IN_K / 100.0  # kilo byte / ms
@@ -172,10 +196,29 @@ def main():
             else:
                 bit_rate = (A_DIM - 1) * (buffer_size - RESEVOIR) / float(CUSHION)
             bit_rate = int(bit_rate)
+        elif abr_policy == 'RBA':
+            estimated_bandwidth = state[2, -1] * M_IN_K * 100.0 * 10
+            buffer_size = state[1, -1] * BUFFER_NORM_FACTOR
+            bit_rate = 0
+            for i, br in enumerate(VIDEO_BIT_RATE):
+                if br <= estimated_bandwidth:
+                    bit_rate = i
+                else:
+                    break
+            if buffer_size < 5:
+                bit_rate = max(0, bit_rate-1)
         elif abr_policy == 'MPC':
             bit_rate = int(mpc_policy(state, video_chunk_remain, buffer_size, net_env, bit_rate))
         elif abr_policy == 'Pensieve':
             bit_rate = pensieve_policy(state)
+        elif abr_policy == 'Mixed':
+            br_bba = bba_policy(buffer_size)
+            br_pensieve = pensieve_policy(state)
+            bit_rate = br_pensieve
+            if br_bba < 3 and br_pensieve != 5 \
+                          and delay > 150 and br_pensieve > br_bba:
+                bit_rate = bit_rate - 1
+            
 
         s_batch.append(state)
         entropy_ = 0.0
@@ -277,7 +320,8 @@ def mpc_policy(state, video_chunk_remain, buffer_size, net_env, bit_rate):
             )  # e.g., if last chunk is 3, then first iter is 3+0+1=4
             download_time = (
                 net_env.get_chunk_size(chunk_quality, index) / 1000000.0
-            ) / future_bandwidth  # this is MB/MB/s --> seconds
+            ) / future_bandwidth * 2  # this is MB/MB/s --> seconds
+
             if curr_buffer < download_time:
                 curr_rebuffer_time += download_time - curr_buffer
                 curr_buffer = 0
@@ -320,31 +364,45 @@ RAND_RANGE = 1000
 ACTOR_LR_RATE = 0.0001
 CRITIC_LR_RATE = 0.001
 
-def pensieve_policy(state):
+def pensieve_policy(state,):
     action_prob = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
     action_cumsum = np.cumsum(action_prob)
     bit_rate = (action_cumsum > np.random.randint(1, RAND_RANGE) / float(RAND_RANGE)).argmax()
     return bit_rate
 
+def bba_policy(buffer_size):
+    RESEVOIR, CUSHION = 5, 10
+    if buffer_size < RESEVOIR:
+        bit_rate = 0
+    elif buffer_size >= RESEVOIR + CUSHION:
+        bit_rate = A_DIM - 1
+    else:
+        bit_rate = (A_DIM - 1) * (buffer_size - RESEVOIR) / float(CUSHION)
+    bit_rate = int(bit_rate)
+    return bit_rate
+
 
 if __name__ == "__main__":
-    with tf.compat.v1.Session() as sess:
+    if 'Pensieve' in abr_policy or 'Mixed' in abr_policy:
+        with tf.compat.v1.Session() as sess:
 
-        actor = a3c.ActorNetwork(sess,
-                                state_dim=[S_INFO, S_LEN], action_dim=A_DIM,
-                                learning_rate=ACTOR_LR_RATE)
+            actor = a3c.ActorNetwork(sess,
+                                    state_dim=[S_INFO, S_LEN], action_dim=A_DIM,
+                                    learning_rate=ACTOR_LR_RATE)
 
-        critic = a3c.CriticNetwork(sess,
-                                state_dim=[S_INFO, S_LEN],
-                                learning_rate=CRITIC_LR_RATE)
+            critic = a3c.CriticNetwork(sess,
+                                    state_dim=[S_INFO, S_LEN],
+                                    learning_rate=CRITIC_LR_RATE)
 
-        sess.run(tf.compat.v1.global_variables_initializer())
-        saver = tf.compat.v1.train.Saver()  # save neural net parameters
+            sess.run(tf.compat.v1.global_variables_initializer())
+            saver = tf.compat.v1.train.Saver()  # save neural net parameters
 
-        # restore neural net parameters
-        nn_model = NN_MODEL
-        if nn_model is not None:  # nn_model is the path to file
-            saver.restore(sess, nn_model)
-            print("Model {} restored.", nn_model)
+            # restore neural net parameters
+            nn_model = NN_MODEL
+            if nn_model is not None:  # nn_model is the path to file
+                saver.restore(sess, nn_model)
+                print("Model {} restored.", nn_model)
 
+            main()
+    else:
         main()
